@@ -37,7 +37,10 @@ Useful options:
 - `--max-depth N` limits how far the search descends
 - `--beam-width N` controls how many likely directories are explored per level
 - `--results N` controls the number of printed results
-- `--hidden` includes hidden files and directories
+- Hidden files and directories are included by default
+- `--no-hidden` disables searching hidden files and directories
 - `--all-results` shows results below the default 50% confidence threshold
+- Parent fallback is enabled by default and searches up to four parent directories
+- `--no-parent-fallback` disables searching parent directories
 
 The API key is never written to disk or included in requests except as the bearer token used by `sysone`.

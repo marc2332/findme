@@ -35,13 +35,17 @@ struct Arguments {
     #[arg(short, long, default_value_t = 10)]
     results: usize,
 
-    /// Include hidden files and directories.
+    /// Disable searching hidden files and directories.
     #[arg(long)]
-    hidden: bool,
+    no_hidden: bool,
 
     /// Show results below the default 50% confidence threshold.
     #[arg(long)]
     all_results: bool,
+
+    /// Disable searching up to four parent directories.
+    #[arg(long)]
+    no_parent_fallback: bool,
 }
 
 #[derive(Clone)]
@@ -75,12 +79,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         is_directory: true,
         score: 1.0,
     }];
+    if !arguments.no_parent_fallback {
+        let mut parent = root.parent().map(Path::to_path_buf);
+        for _ in 0..4 {
+            let Some(path) = parent else {
+                break;
+            };
+            directories.push(Candidate {
+                description: describe_path(&path, true),
+                path: path.clone(),
+                is_directory: true,
+                score: 1.0,
+            });
+            let next_parent = path.parent().map(Path::to_path_buf);
+            if next_parent.as_deref() == Some(path.as_path()) {
+                break;
+            }
+            parent = next_parent;
+        }
+    }
     let mut results = Vec::new();
 
     for _ in 0..arguments.max_depth {
         let children: Vec<Candidate> = directories
             .par_iter()
-            .flat_map_iter(|directory| list_children(directory, arguments.hidden))
+            .flat_map_iter(|directory| list_children(directory, !arguments.no_hidden))
             .collect();
         if children.is_empty() {
             break;
