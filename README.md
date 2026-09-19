@@ -2,19 +2,27 @@
 
 A small CLI that uses TypeSafe's Jev model to search local directory trees from a natural language memory of a file or folder.
 
+## Installation
+
+Install the CLI directly from GitHub:
+
+```sh
+cargo install --git https://github.com/marc2332/findme
+```
+
 ## Usage
 
 Set the API key in the environment:
 
 ```sh
 export TYPESAFE_API_KEY=your_key
-cargo run -- "the freya worktree I was working on about improving the font docs"
+findme "the freya worktree I was working on about improving the font docs"
 ```
 
 The search starts in the current directory. Use `--root` to choose another starting point:
 
 ```sh
-cargo run -- \
+findme \
   --root ~/Projects \
   --max-depth 10 \
   --beam-width 12 \
@@ -30,5 +38,6 @@ Useful options:
 - `--beam-width N` controls how many likely directories are explored per level
 - `--results N` controls the number of printed results
 - `--hidden` includes hidden files and directories
+- `--all-results` shows results below the default 50% confidence threshold
 
 The API key is never written to disk or included in requests except as the bearer token used by `sysone`.
