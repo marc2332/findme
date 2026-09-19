@@ -1,4 +1,5 @@
 use clap::Parser;
+use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde_json::{Value, json};
@@ -39,6 +40,10 @@ struct Arguments {
     #[arg(long)]
     no_hidden: bool,
 
+    /// Print each folder and entry as it is inspected.
+    #[arg(long)]
+    follow: bool,
+
     /// Show results below the default 50% confidence threshold.
     #[arg(long)]
     all_results: bool,
@@ -51,6 +56,7 @@ struct Arguments {
 #[derive(Clone)]
 struct Candidate {
     path: PathBuf,
+    parent_path: PathBuf,
     description: String,
     is_directory: bool,
     score: f64,
@@ -75,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::default();
     let mut directories = vec![Candidate {
         path: root.clone(),
+        parent_path: root.clone(),
         description: describe_path(&root, true),
         is_directory: true,
         score: 1.0,
@@ -85,9 +92,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(path) = parent else {
                 break;
             };
+            if path.parent().is_none() || path.parent().is_some_and(|parent| parent == path) {
+                break;
+            }
             directories.push(Candidate {
                 description: describe_path(&path, true),
                 path: path.clone(),
+                parent_path: path.clone(),
                 is_directory: true,
                 score: 1.0,
             });
@@ -100,10 +111,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut results = Vec::new();
 
-    for _ in 0..arguments.max_depth {
+    for search_depth in 0..arguments.max_depth {
         let children: Vec<Candidate> = directories
             .par_iter()
-            .flat_map_iter(|directory| list_children(directory, !arguments.no_hidden))
+            .flat_map_iter(|directory| {
+                list_children(directory, !arguments.no_hidden, arguments.follow)
+            })
             .collect();
         if children.is_empty() {
             break;
@@ -114,20 +127,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spinner.finish_and_clear();
         let ranked = ranked_result?;
 
-        let mut next_directories = Vec::new();
+        let mut ranked_directories = Vec::new();
         for candidate in ranked {
             if candidate.is_directory {
-                next_directories.push(candidate.clone());
+                ranked_directories.push(candidate.clone());
             }
             results.push(candidate);
         }
-        next_directories.sort_by(compare_candidates);
-        next_directories.truncate(arguments.beam_width);
-        directories = next_directories;
+        if search_depth == 0 {
+            let mut directories_by_parent: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
+            for candidate in ranked_directories {
+                directories_by_parent
+                    .entry(candidate.parent_path.clone())
+                    .or_default()
+                    .push(candidate);
+            }
+            directories = directories_by_parent
+                .into_values()
+                .flat_map(|mut candidates| {
+                    candidates.sort_by(compare_candidates);
+                    candidates.truncate(1);
+                    candidates
+                })
+                .collect();
+        } else {
+            ranked_directories.sort_by(compare_candidates);
+            ranked_directories.truncate(arguments.beam_width);
+            directories = ranked_directories;
+        }
         if directories.is_empty() {
             break;
         }
     }
+
+    let mut unique_results = HashMap::new();
+    for result in results {
+        unique_results
+            .entry(result.path.clone())
+            .and_modify(|existing: &mut Candidate| {
+                if result.score > existing.score {
+                    *existing = result.clone();
+                }
+            })
+            .or_insert(result);
+    }
+    let mut results: Vec<Candidate> = unique_results.into_values().collect();
 
     if !results.is_empty() {
         results.sort_by(compare_candidates);
@@ -144,7 +188,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     results.sort_by(compare_candidates);
     if !arguments.all_results {
-        results.retain(|result| result.score >= 0.5);
+        if let Some(best_score) = results.first().map(|result| result.score) {
+            let minimum_score = best_score * 0.1;
+            results.retain(|result| result.score > 0.0 && result.score >= minimum_score);
+        }
     }
     results.truncate(arguments.results);
     if results.is_empty() {
@@ -178,39 +225,45 @@ fn create_spinner(path: &Path) -> ProgressBar {
     spinner
 }
 
-fn list_children(directory: &Candidate, include_hidden: bool) -> Vec<Candidate> {
-    let entries = match fs::read_dir(&directory.path) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
-    let entries: Vec<_> = entries
+fn list_children(directory: &Candidate, include_hidden: bool, follow: bool) -> Vec<Candidate> {
+    if follow {
+        println!("Walking folder {}", directory.path.display());
+    }
+
+    let entries: Vec<_> = WalkBuilder::new(&directory.path)
+        .max_depth(Some(1))
+        .standard_filters(true)
+        .hidden(!include_hidden)
+        .build()
         .filter_map(|entry| match entry {
-            Ok(entry) => Some(entry),
-            Err(_) => None,
+            Ok(entry) if entry.depth() == 1 => {
+                let file_type = entry.file_type()?;
+                if matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | ".cache" | ".local" | ".cargo")
+                ) || file_type.is_symlink()
+                {
+                    return None;
+                }
+                Some((entry.path().to_path_buf(), file_type.is_dir()))
+            }
+            _ => None,
         })
         .collect();
 
     entries
         .par_iter()
-        .filter_map(|entry| {
-            let file_name = entry.file_name();
-            if !include_hidden && file_name.to_string_lossy().starts_with('.') {
-                return None;
+        .map(|(path, is_directory)| {
+            if follow {
+                println!("  Walking {}", path.display());
             }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => return None,
-            };
-            if file_type.is_symlink() {
-                return None;
-            }
-            let path = entry.path();
-            Some(Candidate {
-                description: describe_path(&path, file_type.is_dir()),
-                path,
-                is_directory: file_type.is_dir(),
+            Candidate {
+                description: describe_path(path, *is_directory),
+                path: path.clone(),
+                parent_path: directory.path.clone(),
+                is_directory: *is_directory,
                 score: directory.score,
-            })
+            }
         })
         .collect()
 }
